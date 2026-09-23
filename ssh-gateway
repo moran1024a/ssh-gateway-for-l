@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# ssh-gateway: manage OpenSSH local-forward tunnels via systemd.
+# Everything lives in the directory containing this script; outside it only
+# systemd symlinks are created (by `install` / `start`) and removed (by `uninstall`).
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SELF="$BASE_DIR/ssh-gateway"
+TUNNEL_DIR="$BASE_DIR/tunnels"
+KNOWN_HOSTS="$BASE_DIR/known_hosts"
+UNIT_NAME="ssh-gateway@.service"
+UNIT_FILE="$BASE_DIR/$UNIT_NAME"
+UNIT_LINK="/etc/systemd/system/$UNIT_NAME"
+
+declare -A C
+
+die()  { echo "error: $*" >&2; exit 1; }
+warn() { echo "error: $*" >&2; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "this command must be run as root"; }
+
+is_installed() { [[ -L $UNIT_LINK && "$(readlink -f "$UNIT_LINK")" == "$UNIT_FILE" ]]; }
+need_installed() { is_installed || die "not installed, run: $SELF install"; }
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; }
+need_name() {
+    [[ -n ${1:-} ]] || die "tunnel name required"
+    valid_name "$1" || die "invalid tunnel name '$1' (allowed: letters, digits, '_', '-')"
+}
+
+unit() { echo "ssh-gateway@$1.service"; }
+
+tunnel_names() {
+    local f
+    for f in "$TUNNEL_DIR"/*.conf; do
+        [[ -e $f ]] || continue
+        f="${f##*/}"
+        f="${f%.conf}"
+        valid_name "$f" && echo "$f"
+    done
+}
+
+valid_port() { [[ $1 =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_host() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+
+key_path() { [[ ${C[JUMP_KEY]} == /* ]] && echo "${C[JUMP_KEY]}" || echo "$BASE_DIR/${C[JUMP_KEY]}"; }
+
+# Parse tunnels/<name>.conf into C. Prints the problem and returns 1 on error.
+load_conf() {
+    local name=$1 file="$TUNNEL_DIR/$1.conf" line n=0 key val ok=0
+    [[ -f $file ]] || { warn "tunnel '$name' not found ($file)"; return 1; }
+    C=([LISTEN_ADDR]=0.0.0.0 [JUMP_PORT]=22 [TARGET_PORT]=22)
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line="${line%%#*}"
+        [[ $line =~ ^[[:space:]]*$ ]] && continue
+        if [[ ! $line =~ ^[[:space:]]*([A-Z_]+)[[:space:]]*=[[:space:]]*([^[:space:]]*)[[:space:]]*$ ]]; then
+            warn "$file:$n: invalid line"; ok=1; continue
+        fi
+        key=${BASH_REMATCH[1]} val=${BASH_REMATCH[2]}
+        case $key in
+            LISTEN_ADDR|LISTEN_PORT|JUMP_HOST|JUMP_PORT|JUMP_USER|JUMP_KEY|TARGET_HOST|TARGET_PORT) C[$key]=$val ;;
+            *) warn "$file:$n: unknown key '$key'"; ok=1 ;;
+        esac
+    done < "$file"
+
+    for key in LISTEN_ADDR JUMP_HOST TARGET_HOST; do
+        valid_host "${C[$key]:-}" || { warn "$file: $key missing or invalid"; ok=1; }
+    done
+    for key in LISTEN_PORT JUMP_PORT TARGET_PORT; do
+        valid_port "${C[$key]:-}" || { warn "$file: $key missing or invalid"; ok=1; }
+    done
+    [[ ${C[JUMP_USER]:-} =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || { warn "$file: JUMP_USER missing or invalid"; ok=1; }
+    [[ -n ${C[JUMP_KEY]:-} ]] || { warn "$file: JUMP_KEY missing"; ok=1; }
+    return $ok
+}
+
+check_key() {
+    [[ -r "$(key_path)" ]] || { warn "key file not readable: $(key_path)"; return 1; }
+}
+
+cmd_install() {
+    need_root
+    if [[ -e $UNIT_LINK || -L $UNIT_LINK ]] && ! is_installed; then
+        die "$UNIT_LINK already exists and does not point to $UNIT_FILE (another installation?)"
+    fi
+    mkdir -p "$TUNNEL_DIR" "$BASE_DIR/keys"
+    chown --reference="$BASE_DIR" "$TUNNEL_DIR" "$BASE_DIR/keys"
+    chmod 700 "$BASE_DIR/keys"
+    cat > "$UNIT_FILE" <<EOF
+[Unit]
+Description=ssh-gateway tunnel %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart="$SELF" run %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    is_installed || systemctl link "$UNIT_FILE" >/dev/null
+    systemctl daemon-reload
+    echo "installed: $UNIT_LINK -> $UNIT_FILE"
+}
+
+cmd_uninstall() {
+    need_root
+    local link inst
+    # Every enabled instance has a symlink in some *.wants directory.
+    for link in /etc/systemd/system/*/ssh-gateway@?*.service; do
+        [[ -L $link ]] || continue
+        inst="${link##*/}"
+        systemctl disable --now "$inst" >/dev/null 2>&1 || true
+        rm -f "$link"
+    done
+    systemctl stop 'ssh-gateway@*.service' 2>/dev/null || true
+    if is_installed; then
+        rm -f "$UNIT_LINK"
+    fi
+    rm -f "$UNIT_FILE"
+    systemctl daemon-reload
+    systemctl reset-failed 'ssh-gateway@*.service' 2>/dev/null || true
+    echo "uninstalled. To remove everything else: rm -rf '$BASE_DIR'"
+}
+
+cmd_add() {
+    need_name "${1:-}"
+    local file="$TUNNEL_DIR/$1.conf"
+    [[ -e $file ]] && die "tunnel '$1' already exists: $file"
+    mkdir -p "$TUNNEL_DIR"
+    cat > "$file" <<'EOF'
+# Listen address and port on this server (LISTEN_ADDR defaults to 0.0.0.0)
+LISTEN_ADDR=0.0.0.0
+LISTEN_PORT=10022
+
+# Jump host (JUMP_PORT defaults to 22). JUMP_KEY is relative to the install dir.
+JUMP_HOST=
+JUMP_PORT=22
+JUMP_USER=
+JUMP_KEY=keys/jump.key
+
+# Final target, reached from the jump host (TARGET_PORT defaults to 22)
+TARGET_HOST=
+TARGET_PORT=22
+EOF
+    echo "created $file"
+    echo "edit it, then run: $SELF start $1"
+}
+
+cmd_remove() {
+    need_root
+    need_name "${1:-}"
+    [[ -f "$TUNNEL_DIR/$1.conf" ]] || die "tunnel '$1' not found"
+    systemctl disable --now "$(unit "$1")" >/dev/null 2>&1 || true
+    systemctl reset-failed "$(unit "$1")" 2>/dev/null || true
+    rm -f "$TUNNEL_DIR/$1.conf"
+    echo "removed $1"
+}
+
+cmd_start() {
+    need_root
+    need_installed
+    need_name "${1:-}"
+    load_conf "$1" && check_key || exit 1
+    systemctl enable --now "$(unit "$1")" 2>/dev/null
+    echo "started $1 (enabled at boot)"
+}
+
+cmd_stop() {
+    need_root
+    need_name "${1:-}"
+    systemctl disable --now "$(unit "$1")" 2>/dev/null
+    echo "stopped $1 (disabled at boot)"
+}
+
+cmd_reload() {
+    need_root
+    need_installed
+    local names name
+    if [[ -n ${1:-} ]]; then need_name "$1"; names=$1; else names=$(tunnel_names); fi
+    for name in $names; do
+        load_conf "$name" || { warn "skipping $name"; continue; }
+        if systemctl is-enabled --quiet "$(unit "$name")"; then
+            systemctl restart "$(unit "$name")"
+            echo "restarted $name"
+        fi
+    done
+}
+
+cmd_status() {
+    local name state boot route
+    is_installed || echo "(not installed)"
+    printf '%-16s %-10s %-9s %s\n' NAME STATE BOOT ROUTE
+    for name in $(tunnel_names); do
+        state=$(systemctl is-active "$(unit "$name")" 2>/dev/null) || true
+        boot=$(systemctl is-enabled "$(unit "$name")" 2>/dev/null) || true
+        if load_conf "$name" 2>/dev/null; then
+            route="${C[LISTEN_ADDR]}:${C[LISTEN_PORT]} -> ${C[JUMP_USER]}@${C[JUMP_HOST]}:${C[JUMP_PORT]} -> ${C[TARGET_HOST]}:${C[TARGET_PORT]}"
+        else
+            route="(invalid config, run: $SELF check $name)"
+        fi
+        printf '%-16s %-10s %-9s %s\n' "$name" "${state:-unknown}" "${boot:-disabled}" "$route"
+    done
+    echo "logs: journalctl -u 'ssh-gateway@<name>'"
+}
+
+cmd_check() {
+    local names name other failed=0 port addr perm banner
+    if [[ -n ${1:-} ]]; then need_name "$1"; names=$1; else names=$(tunnel_names); fi
+    [[ -n $names ]] || die "no tunnels configured"
+    is_installed || { warn "not installed"; failed=1; }
+    for name in $names; do
+        echo "== $name"
+        if ! load_conf "$name"; then failed=1; continue; fi
+        port=${C[LISTEN_PORT]}
+        addr=${C[LISTEN_ADDR]}
+        echo "config ok"
+
+        if check_key; then
+            perm=$(stat -c %a "$(key_path)")
+            [[ $perm =~ ^[4-7]00$ ]] || { warn "key $(key_path) has mode $perm, ssh requires 600"; failed=1; }
+        else
+            failed=1
+        fi
+
+        for other in $(tunnel_names); do
+            [[ $other == "$name" ]] && continue
+            [[ "$(sed -n 's/^[[:space:]]*LISTEN_PORT[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$TUNNEL_DIR/$other.conf")" == "$port" ]] &&
+                { warn "LISTEN_PORT $port also used by tunnel '$other'"; failed=1; }
+        done
+
+        if ! systemctl is-active --quiet "$(unit "$name")"; then
+            warn "service not running (see: journalctl -u $(unit "$name"))"; failed=1; continue
+        fi
+        echo "service running"
+
+        if ! ss -ltnH "sport = :$port" | grep -q .; then
+            warn "port $port not listening"; failed=1; continue
+        fi
+        echo "port $port listening"
+
+        [[ $addr == 0.0.0.0 ]] && addr=127.0.0.1
+        banner=$(timeout 10 bash -c 'exec 3<>"/dev/tcp/$0/$1" && IFS= read -r l <&3 && echo "$l"' "$addr" "$port" 2>/dev/null) || true
+        if [[ $banner == SSH-* ]]; then
+            echo "target reachable: ${banner%$'\r'}"
+        else
+            warn "no SSH banner from target through the tunnel"; failed=1
+        fi
+    done
+    return $failed
+}
+
+cmd_run() {
+    need_name "${1:-}"
+    load_conf "$1" || exit 1
+    exec ssh -NT -F /dev/null \
+        -i "$(key_path)" -o IdentitiesOnly=yes -o BatchMode=yes \
+        -o ExitOnForwardFailure=yes -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
+        -p "${C[JUMP_PORT]}" \
+        -L "${C[LISTEN_ADDR]}:${C[LISTEN_PORT]}:${C[TARGET_HOST]}:${C[TARGET_PORT]}" \
+        "${C[JUMP_USER]}@${C[JUMP_HOST]}"
+}
+
+usage() {
+    cat <<EOF
+usage: ssh-gateway <command> [name]
+
+  install          register the systemd unit (root)
+  uninstall        stop all tunnels and remove every systemd trace (root)
+  add <name>       create tunnels/<name>.conf from a template
+  remove <name>    stop tunnel and delete its config (root)
+  start <name>     start tunnel and enable it at boot (root)
+  stop <name>      stop tunnel and disable it at boot (root)
+  reload [name]    restart running tunnels to apply config changes (root)
+  status           list tunnels and their state
+  check [name]     validate config and test the full path to the target
+  run <name>       run the tunnel in the foreground (used by systemd)
+EOF
+}
+
+cmd=${1:-}
+shift || true
+case $cmd in
+    install|uninstall|add|remove|start|stop|reload|status|check|run) "cmd_$cmd" "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) usage >&2; exit 1 ;;
+esac

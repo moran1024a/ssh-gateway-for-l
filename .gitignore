@@ -1,0 +1,5 @@
+# Runtime files created by ssh-gateway; never commit (keys are private)
+/tunnels/
+/keys/
+/known_hosts
+/ssh-gateway@.service
